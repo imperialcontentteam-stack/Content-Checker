@@ -27,6 +27,7 @@ import json
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -73,7 +74,9 @@ USER_AGENT = {
 # ═══════════════════════════════════════════════════════════════════
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=30 → wait up to 30s for a lock instead of raising
+    # "database is locked" when parallel workers write concurrently
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -880,6 +883,9 @@ with tab_check:
             st.markdown("#### 🚀 Bulk check")
             targets = courses
             st.caption(f"{len(targets)} course(s) will be checked")
+            workers = st.slider("Parallel workers", min_value=1, max_value=10, value=6, key="bulk_workers",
+                                help="How many courses to check at the same time. Higher = faster, "
+                                     "but lower it if you hit API rate limits.")
             if st.button(f"🚀 Run bulk check on {len(targets)} courses", type="primary", key="bulk"):
                 if not api_key:
                     st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
@@ -888,17 +894,33 @@ with tab_check:
                     status = st.empty()
                     results = {"pass": 0, "errors": 0, "failed": 0}
                     log = st.container()
-                    for i, course in enumerate(targets):
-                        status.markdown(f"⏳ **{i+1}/{len(targets)}** — {course['course_name']}")
-                        rep = check_course(course, selected_fields, api_key, model)
-                        save_report(course["id"], selected_fields, rep["status"],
-                                    rep["errors"], rep["summary"], rep.get("rewrites"))
-                        results[rep["status"]] += 1
-                        icon = {"pass": "✅", "errors": "⚠️", "failed": "❌"}[rep["status"]]
-                        log.markdown(f"{icon} **{course['course_name']}** — "
-                                     f"{len(rep['errors'])} issue(s). {rep['summary'][:120]}")
-                        bar.progress((i + 1) / len(targets))
-                        time.sleep(0.4)  # be gentle to the site & API
+                    done = 0
+                    t0 = time.time()
+                    # Workers only do network + LLM work (thread-safe).
+                    # DB writes and UI updates happen here in the main thread.
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        futures = {
+                            pool.submit(check_course, course, selected_fields, api_key, model): course
+                            for course in targets
+                        }
+                        for fut in as_completed(futures):
+                            course = futures[fut]
+                            try:
+                                rep = fut.result()
+                            except Exception as e:
+                                rep = {"course_id": course["id"], "course_name": course["course_name"],
+                                       "status": "failed", "summary": f"Unexpected error: {e}",
+                                       "errors": [], "rewrites": []}
+                            save_report(course["id"], selected_fields, rep["status"],
+                                        rep["errors"], rep["summary"], rep.get("rewrites"))
+                            results[rep["status"]] += 1
+                            done += 1
+                            icon = {"pass": "✅", "errors": "⚠️", "failed": "❌"}[rep["status"]]
+                            log.markdown(f"{icon} **{course['course_name']}** — "
+                                         f"{len(rep['errors'])} issue(s). {rep['summary'][:120]}")
+                            status.markdown(f"⏳ **{done}/{len(targets)}** done "
+                                            f"({time.time() - t0:.0f}s elapsed)")
+                            bar.progress(done / len(targets))
                     status.empty()
                     r1, r2, r3 = st.columns(3)
                     stat(r1, results["pass"], "Passed", "ok")
