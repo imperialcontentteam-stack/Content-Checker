@@ -146,6 +146,24 @@ def all_courses() -> list:
         return [dict(r) for r in c.execute("SELECT * FROM courses ORDER BY course_name")]
 
 
+def clear_all_courses() -> int:
+    """Delete ALL courses and their reports. Returns number of courses removed.
+
+    Note: reports are deleted explicitly because SQLite only honours
+    ON DELETE CASCADE when PRAGMA foreign_keys is enabled, which this
+    app does not turn on.
+    """
+    with get_conn() as c:
+        n = c.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
+        c.execute("DELETE FROM reports")
+        c.execute("DELETE FROM courses")
+        # reset autoincrement counters so new imports start at id 1
+        c.execute("DELETE FROM sqlite_sequence WHERE name IN ('courses', 'reports')")
+    with get_conn() as c:
+        c.execute("VACUUM")
+    return n
+
+
 def save_spec_text(course_id: int, text: str):
     with get_conn() as c:
         c.execute("UPDATE courses SET spec_text=?, updated_at=? WHERE id=?",
@@ -779,6 +797,26 @@ with tab_import:
             pd.DataFrame(courses_now)[["id", "course_name", "course_url", "spec_url", "updated_at"]],
             use_container_width=True, hide_index=True,
         )
+
+        with st.expander("🗑️ Danger zone — clear the database"):
+            st.warning(
+                f"This permanently deletes **all {len(courses_now)} course(s)** and every "
+                "check report from the database. Use this before importing a brand-new "
+                "tracker sheet when you don't want to keep any of the old courses."
+            )
+            confirm_txt = st.text_input(
+                "Type **DELETE** to confirm", key="clear_confirm", placeholder="DELETE"
+            )
+            if st.button(
+                "🗑️ Clear all courses & reports",
+                type="secondary",
+                disabled=(confirm_txt.strip() != "DELETE"),
+                key="clear_all_btn",
+            ):
+                removed = clear_all_courses()
+                st.success(f"Removed {removed} course(s) and all reports. "
+                           "You can now import your new tracker sheet above.")
+                st.rerun()
 
 # ───────────────────────────────────────────────
 # TAB 2 · SPEC EXTRACTION
