@@ -534,12 +534,25 @@ def extract_page_text(url: str, max_chars=12000) -> str:
     return text[:max_chars]
 
 
+def _direct_download_url(url: str) -> str:
+    """Convert share links (e.g. Google Drive /view links) into direct-download
+    URLs so the actual document is fetched instead of a viewer page."""
+    m = re.search(r"drive\.google\.com/file/d/([^/?#]+)", url or "")
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    m = re.search(r"drive\.google\.com/open\?id=([^&#]+)", url or "")
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    return url
+
+
 def extract_spec_text(url: str, max_chars=15000) -> str:
-    """Extract text from a specification document — PDF or web page."""
-    resp = fetch_url(url, timeout=60)
+    """Extract text from a specification document — PDF, Word or web page."""
+    resp = fetch_url(_direct_download_url(url), timeout=60)
     resp.raise_for_status()
     ctype = resp.headers.get("Content-Type", "").lower()
-    if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+    head = resp.content[:8]
+    if head.startswith(b"%PDF") or "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
         import pdfplumber
         parts = []
         with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
@@ -548,6 +561,15 @@ def extract_spec_text(url: str, max_chars=15000) -> str:
                 if sum(len(p) for p in parts) > max_chars:
                     break
         return "\n".join(parts)[:max_chars]
+    if head.startswith(b"PK") and ("officedocument" in ctype
+                                   or url.lower().split("?")[0].endswith(".docx")
+                                   or b"word/" in resp.content[:4000]):
+        d = Document(io.BytesIO(resp.content))
+        parts = [p.text for p in d.paragraphs]
+        for table in d.tables:
+            for row in table.rows:
+                parts.append(" | ".join(cell.text.strip() for cell in row.cells))
+        return "\n".join(p for p in parts if p and p.strip())[:max_chars]
     soup = BeautifulSoup(resp.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
         tag.decompose()
@@ -2037,109 +2059,137 @@ def page_spec_docs():
         st.success("All specification documents are processed ✅ — Run Check reuses the "
                    "stored data without re-reading any document.")
 
-    # ── per-document management ──
+    # ── all documents, always visible — no picking required ──
     st.divider()
-    labels = {f"{'✅' if d['status']=='processed' else ('❌' if d['status']=='error' else '⏳')} "
-              f"{(d.get('filename') or d.get('spec_url') or 'document')[:90]}  "
-              f"· {d.get('course_count') or 0} course(s)": d["id"] for d in docs}
-    pick = st.selectbox("Document", list(labels), key="sd_doc")
-    doc = get_spec_doc(labels[pick])
-    linked = courses_for_doc(doc["id"])
+    st.markdown("#### 📄 All specification documents & stored data")
+    st.caption("Every document and its stored extraction is listed below — Run Check "
+               "validates against exactly what is saved here; no document re-reading "
+               "at check time. Expand a document to view, edit or reprocess it.")
+    q = st.text_input("🔎 Filter documents (URL / filename / qualification name / course)",
+                      key="sd_q").strip().lower()
 
-    a, b, c = st.columns([2, 1, 1])
-    a.markdown(f"**URL:** {doc.get('spec_url') or '—'}  \n"
-               f"**Status:** `{doc.get('status')}`"
-               + (f" · extracted with **{doc.get('method')}**" if doc.get("method") else "")
-               + (f" · processed {doc.get('processed_at')}" if doc.get("processed_at") else "")
-               + (f"  \n**Error:** {doc.get('error')}" if doc.get("error") else ""))
-    with b:
-        if st.button("⚙️ Process now" if doc["status"] != "processed" else "🔄 Reprocess (updated doc)",
-                     key="sd_proc", use_container_width=True):
-            with st.spinner("Reading & extracting the document …"):
-                r = process_spec_document(doc["id"], api_key, model,
-                                          force=(doc["status"] == "processed"))
-            (st.success if r["status"] != "error" else st.error)(r["detail"])
-            if r["status"] != "error":
-                st.rerun()
-    with c:
-        st.caption(f"Used by **{len(linked)}** course(s)")
+    shown = docs
+    if q:
+        def _hit(d):
+            hay = " ".join([str(d.get("spec_url") or ""), str(d.get("filename") or ""),
+                            str(d.get("extracted_json") or "")]).lower()
+            if q in hay:
+                return True
+            return any(q in (x["course_name"] or "").lower() for x in courses_for_doc(d["id"]))
+        shown = [d for d in docs if _hit(d)]
+        st.caption(f"{len(shown)} of {len(docs)} document(s) match")
 
-    up = st.file_uploader("Upload / replace the document file (.pdf / .docx) — processed "
-                          "immediately and stored", type=["pdf", "docx"], key="sd_up")
-    if up and st.button("📑 Process uploaded file", type="primary", key="sd_up_go"):
-        try:
-            text = read_uploaded_spec(up)
-        except Exception as e:
-            st.error(f"Could not read the file: {e}")
-            text = None
-        if text:
-            with st.spinner("Extracting …"):
-                r = process_spec_document(doc["id"], api_key, model, force=True,
-                                          uploaded_text=text, uploaded_name=up.name)
-            (st.success if r["status"] != "error" else st.error)(r["detail"])
-            if r["status"] != "error":
-                st.rerun()
-
-    if linked:
-        with st.expander(f"📚 Courses using this document ({len(linked)})"):
-            st.dataframe(pd.DataFrame([{
-                "Number": x.get("category_id"), "Level": x.get("level"),
-                "Type": x.get("course_type"), "Course": x["course_name"]} for x in linked]),
-                use_container_width=True, hide_index=True)
-
-    # ── stored structured data (editable) ──
-    if doc.get("extracted_json"):
-        st.markdown("#### ✏️ Stored extraction (editable)")
-        st.caption("Run Check validates against exactly what is saved here — no document "
-                   "re-reading at check time.")
+    ICON = {"processed": "✅", "error": "❌"}
+    for d in shown:
+        doc = d
         data = spec_doc_data(doc)
-        edited = {}
-        g1, g2, g3 = st.columns(3)
-        edited["qualification_name"] = g1.text_input(
-            "Qualification Name", data.get("qualification_name") or "", key=f"sd_qn_{doc['id']}")
-        edited["qualification_level"] = g2.text_input(
-            "Qualification Level", str(data.get("qualification_level") or ""), key=f"sd_ql_{doc['id']}")
-        edited["qualification_type"] = g3.text_input(
-            "Qualification Type", data.get("qualification_type") or "", key=f"sd_qt_{doc['id']}")
-        edited["entry_requirements"] = st.text_area(
-            "Entry Requirements", data.get("entry_requirements") or "", height=120,
-            key=f"sd_er_{doc['id']}")
-        edited["method_of_assessment"] = st.text_area(
-            "Method of Assessment", data.get("method_of_assessment") or "", height=120,
-            key=f"sd_ma_{doc['id']}")
-        edited["qualification_specification_requirements"] = st.text_area(
-            "Qualification Specification Requirements", 
-            data.get("qualification_specification_requirements") or "", height=120,
-            key=f"sd_qr_{doc['id']}")
-        lo = st.text_area("Learning Outcomes (one per line)",
-                          "\n".join(data.get("learning_outcomes") or []), height=100,
-                          key=f"sd_lo_{doc['id']}")
-        mu = st.text_area("Mandatory Units (one per line)",
-                          "\n".join(data.get("mandatory_units") or []), height=100,
-                          key=f"sd_mu_{doc['id']}")
-        edited["other_information"] = st.text_area(
-            "Other Relevant Information", data.get("other_information") or "", height=90,
-            key=f"sd_oi_{doc['id']}")
-        if st.button("💾 Save extraction", type="primary", key=f"sd_save_{doc['id']}"):
-            edited["learning_outcomes"] = [l.strip() for l in lo.splitlines() if l.strip()]
-            edited["mandatory_units"] = [l.strip() for l in mu.splitlines() if l.strip()]
-            save_spec_doc(doc["id"], {"extracted_json": json.dumps(edited, ensure_ascii=False)})
-            propagate_doc_to_courses(doc["id"])
-            st.success("Extraction saved ✅ — reused by every linked course.")
-        with st.expander("🔎 Raw document text (stored)"):
-            st.text_area("Document text", doc.get("raw_text") or "", height=240,
-                         key=f"sd_raw_{doc['id']}")
+        title = (data.get("qualification_name") or doc.get("filename")
+                 or doc.get("spec_url") or "document")
+        label = (f"{ICON.get(doc['status'], '⏳')} {title[:95]} · "
+                 f"{doc.get('course_count') or 0} course(s)")
+        with st.expander(label):
+            st.markdown(f"**URL:** {doc.get('spec_url') or '—'}  \n"
+                        f"**Status:** `{doc.get('status')}`"
+                        + (f" · extracted with **{doc.get('method')}**" if doc.get("method") else "")
+                        + (f" · processed {doc.get('processed_at')}" if doc.get("processed_at") else "")
+                        + (f"  \n**Error:** {doc.get('error')}" if doc.get("error") else ""))
+            linked = courses_for_doc(doc["id"])
+            if linked:
+                st.markdown("**Courses:** " + " · ".join(
+                    f"{x.get('category_id') or ''} {x['course_name']}".strip()
+                    for x in linked[:10]) + (" …" if len(linked) > 10 else ""))
 
-    # ── overview table ──
-    st.divider()
-    st.markdown("#### 📄 Document status")
-    st.dataframe(pd.DataFrame([{
-        "Status": {"processed": "✅ processed", "error": "❌ error"}.get(d["status"], "⏳ pending"),
-        "Document": (d.get("filename") or d.get("spec_url") or "—")[:100],
-        "Courses": d.get("course_count") or 0,
-        "Method": d.get("method") or "—",
-        "Processed at": d.get("processed_at") or "—",
-    } for d in docs]), use_container_width=True, hide_index=True)
+            # stored data — always shown
+            if data:
+                for key, lab in SPECDOC_FIELDS:
+                    v = data.get(key)
+                    if not v:
+                        continue
+                    if isinstance(v, list):
+                        v = " • ".join(v)
+                    st.markdown(f"**{lab}:** {v[:600]}{'…' if len(str(v)) > 600 else ''}")
+            else:
+                st.info("Not processed yet — no stored data.")
+
+            b1, b2 = st.columns([1, 3])
+            with b1:
+                if st.button("⚙️ Process" if doc["status"] != "processed" else "🔄 Reprocess",
+                             key=f"sd_proc_{doc['id']}", use_container_width=True):
+                    with st.spinner("Reading & extracting …"):
+                        r = process_spec_document(doc["id"], api_key, model,
+                                                  force=(doc["status"] == "processed"))
+                    (st.success if r["status"] != "error" else st.error)(r["detail"])
+                    if r["status"] != "error":
+                        st.rerun()
+            with b2:
+                edit = st.checkbox("✏️ Edit / upload replacement", key=f"sd_editok_{doc['id']}")
+
+            if edit:
+                up = st.file_uploader("Upload / replace the document file (.pdf / .docx)",
+                                      type=["pdf", "docx"], key=f"sd_up_{doc['id']}")
+                if up and st.button("📑 Process uploaded file", type="primary",
+                                    key=f"sd_upgo_{doc['id']}"):
+                    try:
+                        text = read_uploaded_spec(up)
+                    except Exception as e:
+                        st.error(f"Could not read the file: {e}")
+                        text = None
+                    if text:
+                        with st.spinner("Extracting …"):
+                            r = process_spec_document(doc["id"], api_key, model, force=True,
+                                                      uploaded_text=text, uploaded_name=up.name)
+                        (st.success if r["status"] != "error" else st.error)(r["detail"])
+                        if r["status"] != "error":
+                            st.rerun()
+
+                edited = {}
+                g1, g2, g3 = st.columns(3)
+                edited["qualification_name"] = g1.text_input(
+                    "Qualification Name", data.get("qualification_name") or "",
+                    key=f"sd_qn_{doc['id']}")
+                edited["qualification_level"] = g2.text_input(
+                    "Qualification Level", str(data.get("qualification_level") or ""),
+                    key=f"sd_ql_{doc['id']}")
+                edited["qualification_type"] = g3.text_input(
+                    "Qualification Type", data.get("qualification_type") or "",
+                    key=f"sd_qt_{doc['id']}")
+                edited["entry_requirements"] = st.text_area(
+                    "Entry Requirements", data.get("entry_requirements") or "", height=110,
+                    key=f"sd_er_{doc['id']}")
+                edited["method_of_assessment"] = st.text_area(
+                    "Method of Assessment", data.get("method_of_assessment") or "", height=110,
+                    key=f"sd_ma_{doc['id']}")
+                edited["qualification_specification_requirements"] = st.text_area(
+                    "Qualification Specification Requirements",
+                    data.get("qualification_specification_requirements") or "", height=110,
+                    key=f"sd_qr_{doc['id']}")
+                lo = st.text_area("Learning Outcomes (one per line)",
+                                  "\n".join(data.get("learning_outcomes") or []), height=90,
+                                  key=f"sd_lo_{doc['id']}")
+                mu = st.text_area("Mandatory Units (one per line)",
+                                  "\n".join(data.get("mandatory_units") or []), height=90,
+                                  key=f"sd_mu_{doc['id']}")
+                edited["other_information"] = st.text_area(
+                    "Other Relevant Information", data.get("other_information") or "",
+                    height=80, key=f"sd_oi_{doc['id']}")
+                if st.button("💾 Save extraction", type="primary", key=f"sd_save_{doc['id']}"):
+                    edited["learning_outcomes"] = [l.strip() for l in lo.splitlines() if l.strip()]
+                    edited["mandatory_units"] = [l.strip() for l in mu.splitlines() if l.strip()]
+                    save_spec_doc(doc["id"],
+                                  {"extracted_json": json.dumps(edited, ensure_ascii=False)})
+                    propagate_doc_to_courses(doc["id"])
+                    st.success("Extraction saved ✅ — reused by every linked course.")
+
+    # ── compact status table ──
+    with st.expander("📄 Status table (all documents)"):
+        st.dataframe(pd.DataFrame([{
+            "Status": {"processed": "✅ processed", "error": "❌ error"}.get(d["status"], "⏳ pending"),
+            "Qualification": (spec_doc_data(d).get("qualification_name") or "—")[:80],
+            "Document": (d.get("filename") or d.get("spec_url") or "—")[:100],
+            "Courses": d.get("course_count") or 0,
+            "Method": d.get("method") or "—",
+            "Processed at": d.get("processed_at") or "—",
+        } for d in docs]), use_container_width=True, hide_index=True)
 
 
 # ───────────────────────────────────────────────

@@ -53,8 +53,9 @@ Passwords are stored as salted PBKDF2-SHA256 hashes (200k iterations).
    structured JSON stored in the database: Qualification Name, Level, Type,
    Entry Requirements, Method of Assessment, Qualification Specification
    Requirements, Learning Outcomes, Mandatory Units and Other Relevant
-   Information. A **Process all unprocessed** button handles new imports in one
-   go. Already-processed documents are skipped (reused); re-fetching an
+   Information. Every document and its stored data is listed on the page at all
+   times (with a filter box) — no picking required. A **Process all unprocessed**
+   button handles new imports in one go. Already-processed documents are skipped (reused); re-fetching an
    unchanged document is detected by content hash and skipped too. **Reprocess**
    is available for when a document has been updated, and every extraction is
    editable.
