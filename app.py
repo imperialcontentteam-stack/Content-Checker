@@ -71,7 +71,7 @@ VALIDATION_SECTIONS = [
 
 COURSE_TYPES = ["Award", "Certificate", "Diploma"]
 
-MODEL = "deepseek/deepseek-v4-pro"
+MODEL = "deepseek/deepseek-v4-flash"
 
 RED = "#D71920"
 GREEN = "#1E9E3E"
