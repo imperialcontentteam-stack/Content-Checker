@@ -71,7 +71,7 @@ VALIDATION_SECTIONS = [
 
 COURSE_TYPES = ["Award", "Certificate", "Diploma"]
 
-MODEL = "deepseek/deepseek-v4-pro"
+MODEL = "deepseek/deepseek-v4-Flush"
 
 RED = "#D71920"
 GREEN = "#1E9E3E"
@@ -1881,8 +1881,8 @@ def page_run_check():
             '</div>', unsafe_allow_html=True)
 
     # ── the three check tabs (existing functionality preserved) ──
-    tab_content, tab_grammar, tab_other = st.tabs(
-        ["✅ Content Check", "✍️ Grammar Check", "🧪 Other Checks"])
+    tab_content, tab_other = st.tabs(
+        ["✅ Content Check", "🧪 Other Checks"])
 
     # ═══ CONTENT CHECK — validation against the specification ═══
     with tab_content:
@@ -1918,99 +1918,6 @@ def page_run_check():
                 st.caption(f"Last validated {r['checked_at']} by {r['checked_by']} — "
                            f"status: {'✅ pass' if r['status'] == 'pass' else '⚠️ errors'}. "
                            "Run validation to refresh.")
-
-    # ═══ GRAMMAR CHECK — existing Content Quality Review (unchanged) ═══
-    with tab_grammar:
-        st.caption("Paste or upload course content. The reviewer highlights grammar, "
-                   "articles, sentence structure, capitalisation, proper nouns, spelling, "
-                   "commas and punctuation consistency — colour-coded like a "
-                   "proofreader's markup.")
-
-        legend = "".join(
-            f'<span style="background:{v["bg"]};border:1px solid {v["border"]};color:#2A2F3A;">{v["label"]}</span>'
-            for v in QR_CATEGORIES.values()
-        )
-        st.markdown(f'<div class="qr-legend">{legend}</div>', unsafe_allow_html=True)
-        st.write("")
-
-        src = st.radio("Input", ["Paste text", "Upload file (.txt / .docx)",
-                                 "Use this course's overview"], horizontal=True)
-        text = ""
-        if src == "Paste text":
-            text = st.text_area("Course content to review", height=220,
-                                placeholder="Paste the course description, overview or any page copy here…")
-        elif src == "Use this course's overview":
-            text = course.get("course_overview") or ""
-            if text:
-                st.text_area("Loaded content", text, height=180, key="qr_course_text")
-            else:
-                st.info("This course has no overview text in the tracker.")
-        else:
-            f = st.file_uploader("Upload content", type=["txt", "docx"], key="qr_up")
-            if f:
-                if f.name.lower().endswith(".docx"):
-                    d = Document(io.BytesIO(f.read()))
-                    text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
-                else:
-                    text = f.read().decode("utf-8", errors="ignore")
-                st.text_area("Loaded content", text, height=180)
-
-        if st.button("✍️ Review content quality", type="primary", disabled=not text.strip()):
-            if not api_key:
-                st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
-            else:
-                with st.spinner("Proofreading …"):
-                    try:
-                        result = run_quality_review(text, api_key, model)
-                        st.session_state["qr_result"] = result
-                        st.session_state["qr_text"] = text
-                    except Exception as e:
-                        st.error(f"Review failed: {e}")
-
-        if "qr_result" in st.session_state:
-            result = st.session_state["qr_result"]
-            text = st.session_state["qr_text"]
-            issues = result.get("issues", [])
-
-            c1, c2, c3 = st.columns(3)
-            stat(c1, len(issues), "Issues found", "err" if issues else "ok")
-            top_cat = max({i.get("category") for i in issues},
-                          key=lambda c: sum(1 for i in issues if i.get("category") == c),
-                          default="—")
-            stat(c2, QR_CATEGORIES.get(top_cat, {}).get("label", "—"), "Most common issue", "warn")
-            stat(c3, f"{max(0, 100 - len(issues) * 4)}%", "Quality score", "info")
-            st.write("")
-
-            view_marked, view_fixed, view_list = st.tabs(
-                ["🖍️ Marked-up text", "✅ Corrected text", "📋 Issue list"])
-
-            with view_marked:
-                if issues:
-                    st.markdown(f'<div class="qr-paper">{annotate_text_html(text, issues)}</div>',
-                                unsafe_allow_html=True)
-                    st.caption("Hover a highlight to see the correction and explanation.")
-                else:
-                    st.success("No issues found — this content is clean. 🎉")
-
-            with view_fixed:
-                corrected = result.get("corrected_text", text)
-                st.text_area("Corrected version (copy-ready)", corrected, height=260)
-                st.download_button("⬇️ Download corrected text", corrected,
-                                   file_name="corrected_content.txt")
-
-            with view_list:
-                if not issues:
-                    st.success("Nothing to list — no issues found.")
-                for n, issue in enumerate(issues, start=1):
-                    cat = issue.get("category", "grammar")
-                    sty = QR_CATEGORIES.get(cat, QR_CATEGORIES["grammar"])
-                    st.markdown(
-                        f'<div class="issue-card" style="border-left-color:{sty["border"]}">'
-                        f'<div class="cat" style="color:{sty["border"]}">#{n} · {sty["label"]}</div>'
-                        f'<span class="orig">{html.escape(str(issue.get("original","")))}</span> → '
-                        f'<span class="corr">{html.escape(str(issue.get("correction","")))}</span><br>'
-                        f'<small>{html.escape(str(issue.get("explanation","")))}</small>'
-                        f'</div>', unsafe_allow_html=True)
 
     # ═══ OTHER CHECKS — existing live-page 3-way audit (unchanged) ═══
     with tab_other:
@@ -2110,6 +2017,119 @@ def page_run_check():
                         stat(r3, results["failed"], "Failed to check", "warn")
                         st.success("Bulk check complete — reports saved to the database. "
                                    "Head to 📊 Reports to export the Word document.")
+
+
+
+# ───────────────────────────────────────────────
+# PAGE · GRAMMAR CHECK (user + admin)
+# ───────────────────────────────────────────────
+def page_grammar_check():
+    st.subheader("Content Quality Check")
+
+    courses = all_courses()
+    course = {}
+
+    if courses:
+        st.caption("Choose a course only if you want to use its stored course overview. You can also paste text or upload a file directly.")
+        matches, _ = filter_bar("gc")
+        if matches:
+            name = st.selectbox("Course", [c["course_name"] for c in matches], key="gc_course")
+            course = next(c for c in matches if c["course_name"] == name)
+        else:
+            st.warning("No courses match the selected filters. You can still paste or upload text below.")
+    else:
+        st.info("No courses are available yet, but you can still paste text or upload a file for grammar checking.")
+
+    st.caption("Paste or upload course content. The reviewer highlights grammar, "
+               "articles, sentence structure, capitalisation, proper nouns, spelling, "
+               "commas and punctuation consistency — colour-coded like a "
+               "proofreader's markup.")
+
+    legend = "".join(
+        f'<span style="background:{v["bg"]};border:1px solid {v["border"]};color:#2A2F3A;">{v["label"]}</span>'
+        for v in QR_CATEGORIES.values()
+    )
+    st.markdown(f'<div class="qr-legend">{legend}</div>', unsafe_allow_html=True)
+    st.write("")
+
+    src = st.radio("Input", ["Paste text", "Upload file (.txt / .docx)",
+                             "Use this course's overview"], horizontal=True)
+    text = ""
+    if src == "Paste text":
+        text = st.text_area("Course content to review", height=220,
+                            placeholder="Paste the course description, overview or any page copy here…")
+    elif src == "Use this course's overview":
+        text = course.get("course_overview") or ""
+        if text:
+            st.text_area("Loaded content", text, height=180, key="gc_qr_course_text")
+        else:
+            st.info("This course has no overview text in the tracker.")
+    else:
+        f = st.file_uploader("Upload content", type=["txt", "docx"], key="gc_qr_up")
+        if f:
+            if f.name.lower().endswith(".docx"):
+                d = Document(io.BytesIO(f.read()))
+                text = "\n".join(p.text for p in d.paragraphs if p.text.strip())
+            else:
+                text = f.read().decode("utf-8", errors="ignore")
+            st.text_area("Loaded content", text, height=180)
+
+    if st.button("✍️ Review content quality", type="primary", disabled=not text.strip()):
+        if not api_key:
+            st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
+        else:
+            with st.spinner("Proofreading …"):
+                try:
+                    result = run_quality_review(text, api_key, model)
+                    st.session_state["gc_qr_result"] = result
+                    st.session_state["gc_qr_text"] = text
+                except Exception as e:
+                    st.error(f"Review failed: {e}")
+
+    if "gc_qr_result" in st.session_state:
+        result = st.session_state["gc_qr_result"]
+        text = st.session_state["gc_qr_text"]
+        issues = result.get("issues", [])
+
+        c1, c2, c3 = st.columns(3)
+        stat(c1, len(issues), "Issues found", "err" if issues else "ok")
+        top_cat = max({i.get("category") for i in issues},
+                      key=lambda c: sum(1 for i in issues if i.get("category") == c),
+                      default="—")
+        stat(c2, QR_CATEGORIES.get(top_cat, {}).get("label", "—"), "Most common issue", "warn")
+        stat(c3, f"{max(0, 100 - len(issues) * 4)}%", "Quality score", "info")
+        st.write("")
+
+        view_marked, view_fixed, view_list = st.tabs(
+            ["🖍️ Marked-up text", "✅ Corrected text", "📋 Issue list"])
+
+        with view_marked:
+            if issues:
+                st.markdown(f'<div class="qr-paper">{annotate_text_html(text, issues)}</div>',
+                            unsafe_allow_html=True)
+                st.caption("Hover a highlight to see the correction and explanation.")
+            else:
+                st.success("No issues found — this content is clean. 🎉")
+
+        with view_fixed:
+            corrected = result.get("corrected_text", text)
+            st.text_area("Corrected version (copy-ready)", corrected, height=260)
+            st.download_button("⬇️ Download corrected text", corrected,
+                               file_name="corrected_content.txt")
+
+        with view_list:
+            if not issues:
+                st.success("Nothing to list — no issues found.")
+            for n, issue in enumerate(issues, start=1):
+                cat = issue.get("category", "grammar")
+                sty = QR_CATEGORIES.get(cat, QR_CATEGORIES["grammar"])
+                st.markdown(
+                    f'<div class="issue-card" style="border-left-color:{sty["border"]}">'
+                    f'<div class="cat" style="color:{sty["border"]}">#{n} · {sty["label"]}</div>'
+                    f'<span class="orig">{html.escape(str(issue.get("original","")))}</span> → '
+                    f'<span class="corr">{html.escape(str(issue.get("correction","")))}</span><br>'
+                    f'<small>{html.escape(str(issue.get("explanation","")))}</small>'
+                    f'</div>', unsafe_allow_html=True)
 
 
 # ───────────────────────────────────────────────
@@ -2286,9 +2306,9 @@ def page_users():
 # ═══════════════════════════════════════════════════════════════════
 
 if IS_ADMIN:
-    t_imp, t_spec, t_mng, t_run, t_rep, t_usr = st.tabs(
+    t_imp, t_spec, t_mng, t_run, t_grammar, t_rep, t_usr = st.tabs(
         ["📥 Import Courses", "📑 Spec Documents", "🗂 Manage Courses",
-         "🔍 Run Check", "📊 Reports", "👥 Users"])
+         "🔍 Run Check", "✍️ Grammar Check", "📊 Reports", "👥 Users"])
     with t_imp:
         page_import()
     with t_spec:
@@ -2297,15 +2317,19 @@ if IS_ADMIN:
         page_manage()
     with t_run:
         page_run_check()
+    with t_grammar:
+        page_grammar_check()
     with t_rep:
         page_reports()
     with t_usr:
         page_users()
 else:
-    # Users get the Run Check page (run validation, view & download reports).
+    # Users get Run Check, Grammar Check and Reports.
     # No upload or data-modification pages are available to them.
-    t_run, t_rep = st.tabs(["🔍 Run Check", "📊 Reports"])
+    t_run, t_grammar, t_rep = st.tabs(["🔍 Run Check", "✍️ Grammar Check", "📊 Reports"])
     with t_run:
         page_run_check()
+    with t_grammar:
+        page_grammar_check()
     with t_rep:
         page_reports()
