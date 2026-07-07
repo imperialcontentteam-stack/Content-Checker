@@ -1,8 +1,10 @@
-# 🎓 SLC Course Content Checker — v4
+# 🎓 SLC Course Content Checker — v5
 
-Internal Streamlit tool for the South London College content team, now with
-authentication, tracker-driven filters, specification-document extraction and
-downloadable validation reports.
+Internal Streamlit tool for the South London College content team: authentication,
+tracker-driven filters, **one-time AI extraction of qualification specification
+documents** (stored as structured JSON and reused for every check), live-page
+validation with downloadable reports, plus separate Grammar Check and Other
+Checks tabs.
 
 Stack: **Python · Streamlit · SQLite · OpenRouter API · reportlab**. One file, one local database.
 
@@ -15,9 +17,9 @@ streamlit run app.py
 
 Optionally get an OpenRouter API key at https://openrouter.ai/keys and add it to
 `.streamlit/secrets.toml` as `OPENROUTER_API_KEY = "..."` (or set it as an
-environment variable). Without a key the AI checks are disabled and validation
-falls back to a built-in wording comparison. The SQLite database
-(`slc_checker.db`) is created automatically next to `app.py`.
+environment variable). Without a key, document extraction and validation fall
+back to built-in heuristics. The SQLite database (`slc_checker.db`) is created
+automatically next to `app.py`.
 
 ## Accounts & permissions
 
@@ -29,60 +31,59 @@ Default logins on first run (change them on the 👥 Users page!):
 | `user`  | `user123`  | User |
 
 **Admin** — import the course Excel tracker, upload & manage specification
-documents, manage course records, manage user accounts, plus everything a user
-can do.
+documents, reprocess documents when they change, manage course records and user
+accounts, plus everything a user can do.
 
-**User** — the 🔍 Run Check page only: run validations/checks, view generated
-reports and download them. No permission to upload or modify any data.
+**User** — Run Check, Grammar Check, Other Checks and Reports: run checks, view
+and download reports. No permission to upload or modify any data.
 
 Passwords are stored as salted PBKDF2-SHA256 hashes (200k iterations).
 
-## Workflow
+## The one-time extraction architecture
 
-1. **📥 Import Courses (admin)** — upload the Excel tracker (.xlsx/.csv). Column
-   names are auto-guessed and can be remapped. The **Category ID (Number)**,
-   **Level** and **Type** (Award / Certificate / Diploma) are read from the sheet —
-   Level/Type are derived from the course name when not present as columns —
-   and these values populate the Run Check filters automatically.
-2. **📑 Spec Documents (admin)** — upload the qualification specification
-   (PDF/Word) or extract it from the spec URL. The **Entry Requirements**,
-   **Qualification Specification** and **Method of Assessment** sections are
-   extracted (heuristically, refined with AI when a key is configured), are
-   editable, and are stored per course.
-3. **🔍 Run Check** — pick **Category ID / Level / Type**, then the course. The
-   left panel shows the course details from the tracker; the right panel shows
-   the specification document and its extracted requirements. Three tabs:
-   * **✅ Content Check** — validates *Qualification Specification*, *Entry
-     Requirements* and *Method of Assessment (wording only)* against the
-     specification. The report uses the agreed layout: red section boxes,
-     numbered **Errors identified** (red) with **Recommend Action** (green), a
-     prominent green **No Errors** badge when the course passes, and a summary
-     table of all detected issues. **Download Report** (PDF and Word) sits on
-     the same page.
-   * **✍️ Grammar Check** — the existing colour-coded Content Quality Review
-     (grammar, articles, spelling, punctuation, capitalisation, proper nouns,
-     sentence structure, consistency), unchanged.
-   * **🧪 Other Checks** — the existing 3-way live-page audit (live page vs
-     tracker vs specification) with single and bulk modes and plagiarism-safe
-     rewrite suggestions, unchanged.
-4. **📊 Reports** — validation reports (view + PDF/Word download per course)
-   and the existing live-page audit dashboard with the errors-only Word export.
-5. **👥 Users (admin)** — create accounts, reset passwords, delete accounts.
+1. **📥 Import Courses (admin)** — upload the Excel tracker (Course ID/Number,
+   Course Name, Level, Type, Course URL, Qualification Specification Document
+   URL; columns are auto-guessed and remappable; Level/Type are derived from
+   the course name when not provided). All rows are read automatically. Every
+   **distinct** specification URL is registered as a document and linked to its
+   courses — when several courses share the same document, this is detected and
+   they share one extraction.
+2. **📑 Spec Documents (admin)** — process documents **once**: the document is
+   fetched from its URL (or uploaded as PDF/Word), read, and AI-extracted into
+   structured JSON stored in the database: Qualification Name, Level, Type,
+   Entry Requirements, Method of Assessment, Qualification Specification
+   Requirements, Learning Outcomes, Mandatory Units and Other Relevant
+   Information. A **Process all unprocessed** button handles new imports in one
+   go. Already-processed documents are skipped (reused); re-fetching an
+   unchanged document is detected by content hash and skipped too. **Reprocess**
+   is available for when a document has been updated, and every extraction is
+   editable.
+3. **🔍 Run Check** — filter by **Level**, **Type** and **Course**. The page
+   shows the course details (left) and the stored specification data (right),
+   loads the **live course page**, and compares it against the **stored**
+   extraction — the specification document is never re-read or re-extracted at
+   check time. The AI flags correct content, incorrect wording, incorrect
+   information, missing information, mismatched requirements and grammar issues,
+   with suggested corrections. Reports use the agreed layout (red section boxes,
+   numbered red *Errors identified* with green *Recommend Action*, a green *No
+   Errors* badge on a clean pass, and a summary table) and can be downloaded as
+   **PDF or Word** from the same page.
+4. **✍️ Grammar Check** — its own tab (moved out of Run Check): the colour-coded
+   proofreading review for pasted text, uploaded files or a course's overview.
+5. **🧪 Other Checks** — its own tab: the original live-page 3-way audit
+   (single and bulk) with plagiarism-safe rewrite suggestions.
+6. **📊 Reports** — validation reports (view + PDF/Word download per course) and
+   the live-page audit dashboard with the errors-only Word export.
+7. **👥 Users (admin)** — create accounts, reset passwords, delete accounts.
 
-## Tracker sheet columns
+## Performance
 
-The importer looks for (and lets you remap): Number/Category ID, Course Name,
-Course URL, Specification URL, Entry Requirements, Method of Assessment,
-Course Overview, and optional Level / Type columns. Only **Course Name** is
-mandatory.
-
-## Notes
-
-- Run Check filters are generated **dynamically** from the imported tracker —
-  re-importing the sheet refreshes them.
-- Spec text, extracted sections and reports persist in `slc_checker.db`;
-  re-importing the tracker updates courses without losing extracted specs.
-- Validation reports are saved per run (with who ran them) and the latest per
-  course is available on 📊 Reports.
-- Default model is set in `MODEL` at the top of `app.py`; any OpenRouter model
-  string works.
+- Each specification document is extracted **once** and the structured JSON is
+  reused across all courses and all checks — no duplicate processing.
+- Shared documents are detected by URL, so 10 courses on one specification cost
+  one extraction.
+- Validation prompts use the compact stored data instead of raw documents,
+  cutting AI token usage substantially and speeding up report generation.
+- Content-hash checks mean re-fetching an unchanged document never triggers
+  re-extraction; reprocessing happens only when a document has actually been
+  updated (or is forced by an admin).

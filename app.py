@@ -71,7 +71,7 @@ VALIDATION_SECTIONS = [
 
 COURSE_TYPES = ["Award", "Certificate", "Diploma"]
 
-MODEL = "deepseek/deepseek-v4-Flash"
+MODEL = "deepseek/deepseek-v4-pro"
 
 RED = "#D71920"
 GREEN = "#1E9E3E"
@@ -150,6 +150,23 @@ def init_db():
                 summary      TEXT,
                 results_json TEXT
             );
+
+            -- One row per UNIQUE qualification specification document.
+            -- Several courses can point at the same document; extraction
+            -- happens ONCE per document and is reused for every course.
+            CREATE TABLE IF NOT EXISTS spec_documents (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                spec_url       TEXT UNIQUE,
+                filename       TEXT,
+                raw_text       TEXT,
+                extracted_json TEXT,            -- structured AI extraction
+                status         TEXT DEFAULT 'pending',  -- 'pending'|'processed'|'error'
+                method         TEXT,            -- 'ai' | 'heuristic'
+                error          TEXT,
+                content_hash   TEXT,
+                processed_at   TEXT,
+                updated_at     TEXT
+            );
             """
         )
         # ── migrations ──────────────────────────────────────────────
@@ -163,6 +180,9 @@ def init_db():
                     "spec_qualification", "spec_assessment"]:
             if col not in course_cols:
                 c.execute(f"ALTER TABLE courses ADD COLUMN {col} TEXT")
+        if "spec_doc_id" not in course_cols:
+            c.execute("ALTER TABLE courses ADD COLUMN spec_doc_id INTEGER "
+                      "REFERENCES spec_documents(id)")
 
 
 # ── authentication helpers ──────────────────────────────────────────
@@ -348,6 +368,101 @@ def save_spec_fields(course_id: int, filename=None, spec_text=None,
     if qual is not None: fields["spec_qualification"] = qual
     if assess is not None: fields["spec_assessment"] = assess
     update_course_fields(course_id, fields)
+
+
+# ── specification documents (one row per UNIQUE document) ───────────
+
+def sync_spec_documents() -> dict:
+    """Create a spec_documents row for every distinct specification URL in the
+    courses table and link each course to its document (courses.spec_doc_id).
+    Detects when multiple courses share the same document so it is only
+    processed once. Returns counts."""
+    now = datetime.now().isoformat(timespec="seconds")
+    created = 0
+    with get_conn() as c:
+        urls = [r[0] for r in c.execute(
+            "SELECT DISTINCT spec_url FROM courses "
+            "WHERE spec_url IS NOT NULL AND TRIM(spec_url) != ''")]
+        for url in urls:
+            u = url.strip()
+            row = c.execute("SELECT id FROM spec_documents WHERE spec_url=?", (u,)).fetchone()
+            if not row:
+                c.execute("INSERT INTO spec_documents (spec_url, updated_at) VALUES (?,?)",
+                          (u, now))
+                created += 1
+        # link every course to its document
+        c.execute("""UPDATE courses SET spec_doc_id =
+                       (SELECT d.id FROM spec_documents d
+                        WHERE d.spec_url = TRIM(courses.spec_url))
+                     WHERE spec_url IS NOT NULL AND TRIM(spec_url) != ''""")
+        total = c.execute("SELECT COUNT(*) FROM spec_documents").fetchone()[0]
+        processed = c.execute(
+            "SELECT COUNT(*) FROM spec_documents WHERE status='processed'").fetchone()[0]
+    return {"created": created, "total": total, "processed": processed}
+
+
+def all_spec_docs() -> list:
+    """Every specification document with the number of courses that use it."""
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(
+            """SELECT d.*, COUNT(cs.id) AS course_count
+               FROM spec_documents d
+               LEFT JOIN courses cs ON cs.spec_doc_id = d.id
+               GROUP BY d.id ORDER BY d.spec_url""")]
+
+
+def get_spec_doc(doc_id) -> dict:
+    if not doc_id:
+        return {}
+    with get_conn() as c:
+        r = c.execute("SELECT * FROM spec_documents WHERE id=?", (doc_id,)).fetchone()
+        return dict(r) if r else {}
+
+
+def spec_doc_data(doc: dict) -> dict:
+    """Parse the stored structured JSON of a processed document."""
+    try:
+        return json.loads(doc.get("extracted_json") or "{}")
+    except Exception:
+        return {}
+
+
+def save_spec_doc(doc_id: int, fields: dict):
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = list(fields.values()) + [datetime.now().isoformat(timespec="seconds"), doc_id]
+    with get_conn() as c:
+        c.execute(f"UPDATE spec_documents SET {sets}, updated_at=? WHERE id=?", vals)
+
+
+def courses_for_doc(doc_id: int) -> list:
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM courses WHERE spec_doc_id=? ORDER BY course_name", (doc_id,))]
+
+
+def propagate_doc_to_courses(doc_id: int):
+    """Mirror the document's extracted key sections onto every linked course's
+    legacy spec_* columns (keeps older views & the offline fallback working)."""
+    doc = get_spec_doc(doc_id)
+    data = spec_doc_data(doc)
+    if not data:
+        return
+    qual = data.get("qualification_specification_requirements") or ""
+    head = " · ".join(x for x in [data.get("qualification_name"),
+                                  f"Level {data.get('qualification_level')}" if data.get("qualification_level") else "",
+                                  data.get("qualification_type")] if x)
+    qual_full = (head + "\n" + qual).strip() if head else qual
+    with get_conn() as c:
+        c.execute("""UPDATE courses SET spec_filename=?, spec_entry_requirements=?,
+                     spec_qualification=?, spec_assessment=?, updated_at=?
+                     WHERE spec_doc_id=?""",
+                  (doc.get("filename") or doc.get("spec_url"),
+                   data.get("entry_requirements") or "",
+                   qual_full,
+                   data.get("method_of_assessment") or "",
+                   datetime.now().isoformat(timespec="seconds"), doc_id))
 
 
 def save_report(course_id, fields, status, errors, summary, rewrites=None):
@@ -578,6 +693,163 @@ def ai_extract_sections(text: str, api_key: str, model: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  ONE-TIME SPECIFICATION DOCUMENT PROCESSING
+#  Each unique specification document is read + AI-extracted ONCE, the
+#  structured result is stored as JSON in the database and REUSED for
+#  every course and every Run Check — no re-extraction at check time.
+# ═══════════════════════════════════════════════════════════════════
+
+# field key → human label (order used across the UI)
+SPECDOC_FIELDS = [
+    ("qualification_name",   "Qualification Name"),
+    ("qualification_level",  "Qualification Level"),
+    ("qualification_type",   "Qualification Type"),
+    ("entry_requirements",   "Entry Requirements"),
+    ("method_of_assessment", "Method of Assessment"),
+    ("qualification_specification_requirements", "Qualification Specification Requirements"),
+    ("learning_outcomes",    "Learning Outcomes"),
+    ("mandatory_units",      "Mandatory Units"),
+    ("other_information",    "Other Relevant Information"),
+]
+
+AI_SPECDOC_SYSTEM = (
+    "You extract structured data from UK qualification specification documents. "
+    "You reply ONLY with valid JSON — no markdown, no commentary."
+)
+
+AI_SPECDOC_PROMPT = """Extract ALL of the following from the qualification specification text below. Copy wording faithfully (fix broken line-wrapping but do not reword). Use "" for absent strings and [] for absent lists.
+
+Reply with EXACTLY this JSON shape:
+{{
+  "qualification_name": "the official qualification title",
+  "qualification_level": "e.g. 3",
+  "qualification_type": "Award | Certificate | Diploma",
+  "entry_requirements": "the full entry requirements / entry criteria section",
+  "method_of_assessment": "the full method of assessment section",
+  "qualification_specification_requirements": "the qualification overview / specification requirements: purpose, size (TQT / GLH / credits), structure, rules of combination and any key requirements",
+  "learning_outcomes": ["each learning outcome as one string"],
+  "mandatory_units": ["each mandatory unit as one string, e.g. 'Unit 1: ... (code, credits)'"],
+  "other_information": "anything else useful for validating a course page against this specification (grading, progression, age ranges, etc.)"
+}}
+
+=== SPECIFICATION TEXT ===
+{text}
+"""
+
+
+def ai_extract_spec_json(text: str, api_key: str, model: str) -> dict:
+    raw = call_openrouter(AI_SPECDOC_PROMPT.format(text=text[:24000]),
+                          AI_SPECDOC_SYSTEM, api_key, model)
+    data = parse_json_reply(raw)
+    out = {}
+    for key, _ in SPECDOC_FIELDS:
+        v = data.get(key, [] if key in ("learning_outcomes", "mandatory_units") else "")
+        if key in ("learning_outcomes", "mandatory_units"):
+            out[key] = [str(x).strip() for x in (v or []) if str(x).strip()]
+        else:
+            out[key] = str(v or "").strip()
+    return out
+
+
+def heuristic_spec_json(text: str) -> dict:
+    """Offline fallback — builds the structured record from heading heuristics."""
+    secs = extract_spec_sections(text, max_chars=4000)
+    head = (text or "").strip().splitlines()
+    title = next((l.strip() for l in head if len(l.strip()) > 12), "")[:200]
+    m_lvl = re.search(r"\blevel\s*(\d)\b", text or "", re.I)
+    m_typ = re.search(r"\b(award|certificate|diploma)\b", text or "", re.I)
+    units = re.findall(r"(?im)^\s*(unit\s+\d+[^\n]{0,140})$", text or "")
+    los = re.findall(r"(?im)^\s*((?:LO\s*\d+|learning outcome\s*\d+)[^\n]{0,160})$", text or "")
+    return {
+        "qualification_name": title,
+        "qualification_level": m_lvl.group(1) if m_lvl else "",
+        "qualification_type": m_typ.group(1).title() if m_typ else "",
+        "entry_requirements": secs["entry"],
+        "method_of_assessment": secs["assessment"],
+        "qualification_specification_requirements": secs["qualification"],
+        "learning_outcomes": [l.strip() for l in los][:40],
+        "mandatory_units": [u.strip() for u in units][:40],
+        "other_information": "",
+    }
+
+
+def process_spec_document(doc_id: int, api_key: str, model: str,
+                          force: bool = False,
+                          uploaded_text: str = None, uploaded_name: str = None) -> dict:
+    """Read + AI-extract ONE specification document and store the result.
+
+    - Skips work entirely when the document is already processed (reuse),
+      unless `force` is set or replacement content is supplied.
+    - Skips re-extraction when a re-fetched document is unchanged (hash check).
+    Returns {"status": "processed"|"reused"|"unchanged"|"error", "detail": str}.
+    """
+    doc = get_spec_doc(doc_id)
+    if not doc:
+        return {"status": "error", "detail": "Document not found."}
+
+    if doc.get("status") == "processed" and not force and uploaded_text is None:
+        return {"status": "reused", "detail": "Already processed — stored data reused."}
+
+    # 1) obtain the document text (upload beats URL fetch)
+    try:
+        if uploaded_text is not None:
+            text, fname = uploaded_text, (uploaded_name or doc.get("filename"))
+        else:
+            if not doc.get("spec_url"):
+                raise ValueError("No specification URL recorded and no file uploaded.")
+            text = extract_spec_text(doc["spec_url"], max_chars=30000)
+            fname = doc["spec_url"]
+        if not (text or "").strip():
+            raise ValueError("The document contained no extractable text.")
+    except Exception as e:
+        save_spec_doc(doc_id, {"status": "error", "error": str(e)})
+        return {"status": "error", "detail": f"Could not read the document: {e}"}
+
+    # 2) unchanged? → keep the existing extraction (unless forced)
+    h = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+    if (doc.get("status") == "processed" and doc.get("content_hash") == h
+            and not force and doc.get("extracted_json")):
+        save_spec_doc(doc_id, {"filename": fname, "error": None})
+        return {"status": "unchanged", "detail": "Document unchanged — existing extraction kept."}
+
+    # 3) extract structured data (AI, with heuristic fallback)
+    method = "heuristic"
+    data = None
+    if api_key:
+        try:
+            data = ai_extract_spec_json(text, api_key, model)
+            method = "ai"
+        except Exception:
+            data = None
+    if data is None:
+        data = heuristic_spec_json(text)
+
+    now = datetime.now().isoformat(timespec="seconds")
+    save_spec_doc(doc_id, {
+        "filename": fname, "raw_text": text[:60000],
+        "extracted_json": json.dumps(data, ensure_ascii=False),
+        "status": "processed", "method": method, "error": None,
+        "content_hash": h, "processed_at": now,
+    })
+    propagate_doc_to_courses(doc_id)
+    return {"status": "processed", "detail": f"Processed with {method} extraction."}
+
+
+def spec_data_for_prompt(data: dict, limit: int = 12000) -> str:
+    """Compact plain-text rendering of the stored structured data for the
+    validation prompt — keeps AI token usage low (no raw document text)."""
+    parts = []
+    for key, label in SPECDOC_FIELDS:
+        v = data.get(key)
+        if not v:
+            continue
+        if isinstance(v, list):
+            v = "\n".join(f"- {x}" for x in v)
+        parts.append(f"## {label}\n{v}")
+    return "\n\n".join(parts)[:limit]
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  COURSE CHECKING  (existing "Other Checks" — unchanged functionality)
 # ═══════════════════════════════════════════════════════════════════
 
@@ -760,25 +1032,39 @@ def check_course(course: dict, fields: list, api_key: str, model: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 
 VALIDATE_SYSTEM = (
-    "You are a meticulous quality auditor for South London College. You compare the "
-    "COURSE RECORD (from the internal tracker) against the OFFICIAL QUALIFICATION "
-    "SPECIFICATION and flag incorrect wording, missing information and mismatched "
-    "requirements. You reply ONLY with valid JSON — no markdown, no commentary."
+    "You are a meticulous quality auditor for South London College. You compare a live "
+    "COURSE PAGE (plus the internal course record) against the OFFICIAL QUALIFICATION "
+    "SPECIFICATION data and flag incorrect wording, incorrect information, missing "
+    "information, mismatched requirements and grammar issues. You reply ONLY with "
+    "valid JSON — no markdown, no commentary."
 )
 
 VALIDATE_PROMPT = """Validate the course "{name}" (Level {level} {ctype}, ref {number}).
 
-Compare ONLY these sections. For each, the CURRENT text (course record) is checked against the SPECIFICATION text:
+=== OFFICIAL QUALIFICATION SPECIFICATION (extracted, authoritative) ===
+{spec}
 
-{sections}
+=== LIVE COURSE PAGE CONTENT ===
+{page}
+
+=== INTERNAL COURSE RECORD (tracker) ===
+Entry Requirements: {rec_entry}
+Method of Assessment: {rec_assess}
+
+Compare the course content against the specification and report on EXACTLY these sections:
+
+1. "Qualification Specification" — the qualification title, level, type, size (TQT/GLH/credits), structure and key specification requirements stated on the course page / record must match the specification. Also verify learning outcomes and mandatory units mentioned by the course are correct.
+2. "Entry Requirement" — every requirement in the specification must be present and correct; flag anything missing, contradictory or extra.
+3. "Method of Assessment" — compared on WORDING ONLY: the course wording must faithfully match the specification's assessment wording (paraphrase is fine, but nothing incorrect, extra or missing).
+4. "Content & Grammar" — any incorrect information or notable grammar/wording problems in the course content relevant to the specification (only clear issues; do not nitpick style).
 
 Rules:
-- "Method of Assessment" must be compared on WORDING ONLY — the current wording must faithfully match the specification's assessment wording (paraphrase is fine, but nothing incorrect, extra or missing).
-- "Entry Requirement" — every requirement in the specification must be present and correct in the current text; flag anything missing, contradictory or extra.
-- "Qualification Specification" — the qualification title, level, type and key details in the current record must match the specification.
-- If the CURRENT text is empty → one issue of type "missing".
-- If the SPECIFICATION text is empty → one issue of type "mismatch" explaining the specification section could not be found.
-- Number issues per section starting at 1. Keep each error and recommendation to one or two clear sentences.
+- Prefer the LIVE COURSE PAGE as the "current" text for each section; fall back to the internal record when the page lacks that section.
+- In each section, set "current" to the exact course text you assessed (short excerpt, max ~120 words).
+- If the course text for a section is empty → one issue of type "missing".
+- If the specification lacks the data needed to verify a section → one issue of type "mismatch" saying it could not be verified.
+- Number issues per section starting at 1. Keep each error and recommendation to one or two clear sentences. Recommendations must state the corrected wording where possible.
+- issue "type" must be one of: incorrect_wording | incorrect_information | missing | mismatch | grammar.
 
 Reply with EXACTLY this JSON shape:
 {{
@@ -786,11 +1072,12 @@ Reply with EXACTLY this JSON shape:
   "summary": "one or two sentence overall verdict",
   "sections": [
     {{
-      "section": "Qualification Specification | Entry Requirement | Method of Assessment",
+      "section": "Qualification Specification | Entry Requirement | Method of Assessment | Content & Grammar",
       "status": "correct | incorrect_wording | missing | mismatch",
+      "current": "the course text assessed for this section",
       "issues": [
         {{
-          "type": "incorrect_wording | missing | mismatch",
+          "type": "incorrect_wording | incorrect_information | missing | mismatch | grammar",
           "error": "clear description of the error identified",
           "recommendation": "the recommended action / corrected wording"
         }}
@@ -876,52 +1163,61 @@ def _fallback_compare(label: str, current: str, spec: str) -> dict:
     return section
 
 
-def validate_course_vs_spec(course: dict, api_key: str, model: str) -> dict:
-    """Compare the course record against the extracted specification sections.
-    Returns {status, summary, sections:[{section,status,current,spec,issues:[...]}]}."""
-    pairs = []
-    for cur_key, spec_key, label in VALIDATION_SECTIONS:
-        current = course.get(cur_key) or ""
-        if cur_key == "qualification_spec_current" and not current:
-            # sensible default: the qualification title as recorded in the tracker
-            current = course.get("course_name") or ""
-        pairs.append((label, current, course.get(spec_key) or ""))
-
+def validate_course_vs_spec(course: dict, spec_data: dict, page_text: str,
+                            api_key: str, model: str) -> dict:
+    """Compare the course content (live page + tracker record) against the
+    STORED specification data — the document is never re-read here.
+    Returns {status, summary, sections:[{section,status,current,issues:[...]}]}."""
     result = {"status": "pass", "summary": "", "sections": []}
 
-    if api_key:
-        blocks = []
-        for label, current, spec in pairs:
-            blocks.append(
-                f"### SECTION: {label}\n"
-                f"--- CURRENT (course record) ---\n{current or '(empty)'}\n"
-                f"--- SPECIFICATION ---\n{spec or '(empty)'}\n"
-            )
+    if api_key and spec_data:
         prompt = VALIDATE_PROMPT.format(
             name=course.get("course_name", ""),
             level=course.get("level") or "?",
             ctype=course.get("course_type") or "?",
             number=course.get("category_id") or "—",
-            sections="\n".join(blocks),
+            spec=spec_data_for_prompt(spec_data),
+            page=(page_text or "(course page unavailable)")[:9000],
+            rec_entry=(course.get("entry_requirements") or "(empty)")[:1500],
+            rec_assess=(course.get("method_of_assessment") or "(empty)")[:1500],
         )
         try:
             data = parse_json_reply(call_openrouter(prompt, VALIDATE_SYSTEM, api_key, model))
-            by_name = { _norm(s.get("section","")): s for s in data.get("sections", []) }
-            for label, current, spec in pairs:
-                s = by_name.get(_norm(label), {"section": label, "status": "correct", "issues": []})
+            for s in data.get("sections", []):
                 result["sections"].append({
-                    "section": label, "current": current, "spec": spec,
+                    "section": str(s.get("section", "Section")),
+                    "current": str(s.get("current", "") or ""),
                     "status": s.get("status", "correct"),
                     "issues": s.get("issues", []) or [],
                 })
             result["summary"] = data.get("summary", "")
             result["status"] = ("errors" if any(sec["issues"] for sec in result["sections"])
                                 else "pass")
-            return result
+            if result["sections"]:
+                return result
         except Exception as e:
             result["summary"] = f"AI validation unavailable ({e}) — used built-in comparison. "
+            result["sections"] = []
 
-    # deterministic fallback (also used when the AI call fails)
+    # deterministic fallback (no API key / AI failure) — compares against the
+    # stored structured data, never re-reads the document
+    qual_head = " · ".join(x for x in [
+        spec_data.get("qualification_name"),
+        f"Level {spec_data.get('qualification_level')}" if spec_data.get("qualification_level") else "",
+        spec_data.get("qualification_type")] if x)
+    spec_qual = (qual_head + "\n" + (spec_data.get("qualification_specification_requirements") or "")).strip()
+    src = page_text or ""
+    pairs = [
+        ("Qualification Specification",
+         course.get("qualification_spec_current") or course.get("course_name") or src[:1200],
+         spec_qual),
+        ("Entry Requirement",
+         course.get("entry_requirements") or "",
+         spec_data.get("entry_requirements") or ""),
+        ("Method of Assessment",
+         course.get("method_of_assessment") or "",
+         spec_data.get("method_of_assessment") or ""),
+    ]
     for label, current, spec in pairs:
         s = _fallback_compare(label, current, spec)
         s.update({"current": current, "spec": spec})
@@ -1547,14 +1843,20 @@ with st.sidebar:
 #  PAGES
 # ═══════════════════════════════════════════════════════════════════
 
-def filter_bar(key_prefix: str):
-    """Category ID / Level / Type filters — populated dynamically from the
-    imported tracker sheet. Returns the filtered course list + the selection."""
+def filter_bar(key_prefix: str, show_category: bool = True):
+    """Level / Type (and optionally Category ID) filters — populated dynamically
+    from the imported tracker sheet. Returns the filtered course list + selection."""
     opts = filter_options()
-    f1, f2, f3 = st.columns(3)
-    cat = f1.selectbox("Category ID", ["All"] + opts["category_ids"], key=f"{key_prefix}_cat")
-    lvl = f2.selectbox("Level", ["All"] + [str(l) for l in opts["levels"]], key=f"{key_prefix}_lvl")
-    typ = f3.selectbox("Type", ["All"] + opts["types"], key=f"{key_prefix}_typ")
+    if show_category:
+        f1, f2, f3 = st.columns(3)
+        cat = f1.selectbox("Category ID", ["All"] + opts["category_ids"], key=f"{key_prefix}_cat")
+        lvl = f2.selectbox("Level", ["All"] + [str(l) for l in opts["levels"]], key=f"{key_prefix}_lvl")
+        typ = f3.selectbox("Type", ["All"] + opts["types"], key=f"{key_prefix}_typ")
+    else:
+        f1, f2 = st.columns(2)
+        cat = "All"
+        lvl = f1.selectbox("Level", ["All"] + [str(l) for l in opts["levels"]], key=f"{key_prefix}_lvl")
+        typ = f2.selectbox("Type", ["All"] + opts["types"], key=f"{key_prefix}_typ")
     matches = courses_filtered(cat, lvl, typ)
     return matches, {"category_id": cat, "level": lvl, "type": typ}
 
@@ -1658,8 +1960,18 @@ def page_import():
             stat(s1, inserted, "New courses", "ok")
             stat(s2, updated, "Updated", "info")
             stat(s3, skipped, "Skipped (no name)", "warn")
-            st.success("Tracker imported into the database ✅ — the Run Check filters "
-                       "now reflect this sheet.")
+
+            # register every distinct specification document and link courses —
+            # shared documents are detected so each is processed only once
+            docs = sync_spec_documents()
+            d1, d2, d3 = st.columns(3)
+            stat(d1, docs["total"], "Unique spec documents", "info")
+            stat(d2, docs["created"], "New documents registered", "ok")
+            stat(d3, docs["total"] - docs["processed"], "Awaiting processing", "warn"
+                 if docs["total"] - docs["processed"] else "ok")
+            st.success("Tracker imported ✅ — the Run Check filters now reflect this "
+                       "sheet. Process any new specification documents in "
+                       "**📑 Spec Documents** (one-time extraction, reused for every check).")
 
     st.divider()
     if courses_now := all_courses():
@@ -1676,106 +1988,158 @@ def page_import():
 # ───────────────────────────────────────────────
 def page_spec_docs():
     st.subheader("Qualification specification documents")
-    st.caption("Upload a specification document (PDF / Word) — or extract from the spec "
-               "URL — then the Entry Requirements, Qualification Specification and "
-               "Method of Assessment sections are extracted and stored for validation.")
+    st.caption("Each **unique** specification document is read and AI-extracted **once** — "
+               "the structured data (qualification name/level/type, entry requirements, "
+               "assessment, requirements, learning outcomes, mandatory units) is stored in "
+               "the database and **reused** by every course and every Run Check. Courses "
+               "sharing the same document automatically share the same extraction. "
+               "Reprocess only when a document has been updated.")
 
-    courses = all_courses()
-    if not courses:
+    if not all_courses():
         st.info("Import your tracker sheet first (📥 Import Courses).")
         return
+    sync_spec_documents()  # keep documents/links in sync with the courses table
+    docs = all_spec_docs()
+    if not docs:
+        st.warning("No specification document URLs found in the imported tracker.")
+        return
 
-    have_all = [c for c in courses if c.get("spec_entry_requirements")
-                and c.get("spec_qualification") and c.get("spec_assessment")]
-    have_text = [c for c in courses if c.get("spec_text")]
-    s1, s2, s3 = st.columns(3)
-    stat(s1, len(courses), "Total courses", "info")
-    stat(s2, len(have_text), "Spec text stored", "ok")
-    stat(s3, len(have_all), "All 3 sections extracted", "ok" if have_all else "warn")
+    processed = [d for d in docs if d["status"] == "processed"]
+    errored = [d for d in docs if d["status"] == "error"]
+    pending = [d for d in docs if d["status"] not in ("processed", "error")]
+    shared = [d for d in docs if (d.get("course_count") or 0) > 1]
+    s1, s2, s3, s4 = st.columns(4)
+    stat(s1, len(docs), "Unique documents", "info")
+    stat(s2, len(processed), "Processed", "ok" if processed else "warn")
+    stat(s3, len(pending) + len(errored), "Pending / error", "warn" if pending or errored else "ok")
+    stat(s4, len(shared), "Shared by 2+ courses", "info")
     st.write("")
 
-    matches, _ = filter_bar("spec")
-    if not matches:
-        st.warning("No courses match the selected filters.")
-        return
-    name = st.selectbox("Course", [c["course_name"] for c in matches], key="spec_course")
-    course = next(c for c in matches if c["course_name"] == name)
-
-    st.markdown(f"**Stored document:** {course.get('spec_filename') or '—'} · "
-                f"**Spec URL:** {course.get('spec_url') or '—'}")
-
-    src = st.radio("Specification source",
-                   ["Upload document (.pdf / .docx)", "Extract from spec URL"],
-                   horizontal=True, key="spec_src")
-    new_text = None
-    new_filename = None
-    if src.startswith("Upload"):
-        f = st.file_uploader("Specification document", type=["pdf", "docx"], key="spec_up")
-        if f and st.button("📑 Extract from uploaded document", type="primary"):
-            with st.spinner("Reading document …"):
-                try:
-                    new_text = read_uploaded_spec(f)
-                    new_filename = f.name
-                except Exception as e:
-                    st.error(f"Could not read the document: {e}")
+    # ── batch: process everything that hasn't been processed yet ──
+    todo = pending + errored
+    if todo:
+        if st.button(f"⚙️ Process all unprocessed documents ({len(todo)})", type="primary",
+                     key="proc_all"):
+            bar = st.progress(0.0)
+            line = st.empty()
+            ok = err = 0
+            for i, d in enumerate(todo, start=1):
+                line.markdown(f"⏳ {i}/{len(todo)} — {d.get('spec_url') or d.get('filename')}")
+                r = process_spec_document(d["id"], api_key, model)
+                ok += r["status"] in ("processed", "reused", "unchanged")
+                err += r["status"] == "error"
+                bar.progress(i / len(todo))
+            line.empty()
+            st.success(f"Done — {ok} processed, {err} failed. Failed documents can be "
+                       "fixed by uploading the file manually below.")
+            st.rerun()
     else:
-        if not course.get("spec_url"):
-            st.warning("This course has no specification URL in the tracker.")
-        elif st.button("🌐 Extract from spec URL", type="primary"):
-            with st.spinner("Fetching specification …"):
-                try:
-                    new_text = extract_spec_text(course["spec_url"])
-                    new_filename = course["spec_url"]
-                except Exception as e:
-                    st.error(f"Could not fetch the specification: {e}")
+        st.success("All specification documents are processed ✅ — Run Check reuses the "
+                   "stored data without re-reading any document.")
 
-    if new_text:
-        sections = extract_spec_sections(new_text)
-        if api_key:
-            try:
-                with st.spinner("Refining section extraction with AI …"):
-                    ai = ai_extract_sections(new_text, api_key, model)
-                for k in sections:
-                    if ai.get(k):
-                        sections[k] = ai[k]
-            except Exception:
-                pass  # heuristic extraction already in place
-        save_spec_fields(course["id"], filename=new_filename, spec_text=new_text,
-                         entry=sections["entry"], qual=sections["qualification"],
-                         assess=sections["assessment"])
-        st.success("Specification stored and sections extracted ✅")
-        course = get_course(course["id"])
-
-    st.markdown("#### ✏️ Extracted sections (editable)")
-    st.caption("Review and correct the extracted text — validation compares against "
-               "exactly what is saved here.")
-    e_qual = st.text_area("Qualification Specification",
-                          course.get("spec_qualification") or "", height=140,
-                          key=f"eq_{course['id']}")
-    e_entry = st.text_area("Entry Requirements",
-                           course.get("spec_entry_requirements") or "", height=140,
-                           key=f"ee_{course['id']}")
-    e_assess = st.text_area("Method of Assessment",
-                            course.get("spec_assessment") or "", height=140,
-                            key=f"ea_{course['id']}")
-    if st.button("💾 Save sections", type="primary", key="save_secs"):
-        save_spec_fields(course["id"], entry=e_entry, qual=e_qual, assess=e_assess)
-        st.success("Sections saved ✅")
-
-    with st.expander("🔎 Full extracted specification text"):
-        st.text_area("Specification text", course.get("spec_text") or "", height=260,
-                     key=f"full_{course['id']}")
-
+    # ── per-document management ──
     st.divider()
-    st.markdown("#### 📄 Extraction status")
+    labels = {f"{'✅' if d['status']=='processed' else ('❌' if d['status']=='error' else '⏳')} "
+              f"{(d.get('filename') or d.get('spec_url') or 'document')[:90]}  "
+              f"· {d.get('course_count') or 0} course(s)": d["id"] for d in docs}
+    pick = st.selectbox("Document", list(labels), key="sd_doc")
+    doc = get_spec_doc(labels[pick])
+    linked = courses_for_doc(doc["id"])
+
+    a, b, c = st.columns([2, 1, 1])
+    a.markdown(f"**URL:** {doc.get('spec_url') or '—'}  \n"
+               f"**Status:** `{doc.get('status')}`"
+               + (f" · extracted with **{doc.get('method')}**" if doc.get("method") else "")
+               + (f" · processed {doc.get('processed_at')}" if doc.get("processed_at") else "")
+               + (f"  \n**Error:** {doc.get('error')}" if doc.get("error") else ""))
+    with b:
+        if st.button("⚙️ Process now" if doc["status"] != "processed" else "🔄 Reprocess (updated doc)",
+                     key="sd_proc", use_container_width=True):
+            with st.spinner("Reading & extracting the document …"):
+                r = process_spec_document(doc["id"], api_key, model,
+                                          force=(doc["status"] == "processed"))
+            (st.success if r["status"] != "error" else st.error)(r["detail"])
+            if r["status"] != "error":
+                st.rerun()
+    with c:
+        st.caption(f"Used by **{len(linked)}** course(s)")
+
+    up = st.file_uploader("Upload / replace the document file (.pdf / .docx) — processed "
+                          "immediately and stored", type=["pdf", "docx"], key="sd_up")
+    if up and st.button("📑 Process uploaded file", type="primary", key="sd_up_go"):
+        try:
+            text = read_uploaded_spec(up)
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
+            text = None
+        if text:
+            with st.spinner("Extracting …"):
+                r = process_spec_document(doc["id"], api_key, model, force=True,
+                                          uploaded_text=text, uploaded_name=up.name)
+            (st.success if r["status"] != "error" else st.error)(r["detail"])
+            if r["status"] != "error":
+                st.rerun()
+
+    if linked:
+        with st.expander(f"📚 Courses using this document ({len(linked)})"):
+            st.dataframe(pd.DataFrame([{
+                "Number": x.get("category_id"), "Level": x.get("level"),
+                "Type": x.get("course_type"), "Course": x["course_name"]} for x in linked]),
+                use_container_width=True, hide_index=True)
+
+    # ── stored structured data (editable) ──
+    if doc.get("extracted_json"):
+        st.markdown("#### ✏️ Stored extraction (editable)")
+        st.caption("Run Check validates against exactly what is saved here — no document "
+                   "re-reading at check time.")
+        data = spec_doc_data(doc)
+        edited = {}
+        g1, g2, g3 = st.columns(3)
+        edited["qualification_name"] = g1.text_input(
+            "Qualification Name", data.get("qualification_name") or "", key=f"sd_qn_{doc['id']}")
+        edited["qualification_level"] = g2.text_input(
+            "Qualification Level", str(data.get("qualification_level") or ""), key=f"sd_ql_{doc['id']}")
+        edited["qualification_type"] = g3.text_input(
+            "Qualification Type", data.get("qualification_type") or "", key=f"sd_qt_{doc['id']}")
+        edited["entry_requirements"] = st.text_area(
+            "Entry Requirements", data.get("entry_requirements") or "", height=120,
+            key=f"sd_er_{doc['id']}")
+        edited["method_of_assessment"] = st.text_area(
+            "Method of Assessment", data.get("method_of_assessment") or "", height=120,
+            key=f"sd_ma_{doc['id']}")
+        edited["qualification_specification_requirements"] = st.text_area(
+            "Qualification Specification Requirements", 
+            data.get("qualification_specification_requirements") or "", height=120,
+            key=f"sd_qr_{doc['id']}")
+        lo = st.text_area("Learning Outcomes (one per line)",
+                          "\n".join(data.get("learning_outcomes") or []), height=100,
+                          key=f"sd_lo_{doc['id']}")
+        mu = st.text_area("Mandatory Units (one per line)",
+                          "\n".join(data.get("mandatory_units") or []), height=100,
+                          key=f"sd_mu_{doc['id']}")
+        edited["other_information"] = st.text_area(
+            "Other Relevant Information", data.get("other_information") or "", height=90,
+            key=f"sd_oi_{doc['id']}")
+        if st.button("💾 Save extraction", type="primary", key=f"sd_save_{doc['id']}"):
+            edited["learning_outcomes"] = [l.strip() for l in lo.splitlines() if l.strip()]
+            edited["mandatory_units"] = [l.strip() for l in mu.splitlines() if l.strip()]
+            save_spec_doc(doc["id"], {"extracted_json": json.dumps(edited, ensure_ascii=False)})
+            propagate_doc_to_courses(doc["id"])
+            st.success("Extraction saved ✅ — reused by every linked course.")
+        with st.expander("🔎 Raw document text (stored)"):
+            st.text_area("Document text", doc.get("raw_text") or "", height=240,
+                         key=f"sd_raw_{doc['id']}")
+
+    # ── overview table ──
+    st.divider()
+    st.markdown("#### 📄 Document status")
     st.dataframe(pd.DataFrame([{
-        "Number": c.get("category_id"), "Level": c.get("level"),
-        "Type": c.get("course_type"), "Course": c["course_name"],
-        "Document": c.get("spec_filename") or "—",
-        "Entry Req.": "✅" if c.get("spec_entry_requirements") else "—",
-        "Qual. Spec": "✅" if c.get("spec_qualification") else "—",
-        "Assessment": "✅" if c.get("spec_assessment") else "—",
-    } for c in all_courses()]), use_container_width=True, hide_index=True)
+        "Status": {"processed": "✅ processed", "error": "❌ error"}.get(d["status"], "⏳ pending"),
+        "Document": (d.get("filename") or d.get("spec_url") or "—")[:100],
+        "Courses": d.get("course_count") or 0,
+        "Method": d.get("method") or "—",
+        "Processed at": d.get("processed_at") or "—",
+    } for d in docs]), use_container_width=True, hide_index=True)
 
 
 # ───────────────────────────────────────────────
@@ -1847,199 +2211,100 @@ def page_manage():
 # ───────────────────────────────────────────────
 def page_run_check():
     st.subheader("Run Check")
+    st.caption("Validates the live course page against the **stored** qualification "
+               "specification data — the specification document is **not** re-read or "
+               "re-extracted here.")
     courses = all_courses()
     if not courses:
         st.info("No courses available yet — an administrator must import the tracker "
                 "sheet first.")
         return
 
-    # ── filters (populated dynamically from the imported tracker) ──
-    matches, _ = filter_bar("rc")
+    # ── filters: Level · Type · Course (populated from the imported tracker) ──
+    matches, _ = filter_bar("rc", show_category=False)
     if not matches:
         st.warning("No courses match the selected filters.")
         return
-    name = st.selectbox("Course", [c["course_name"] for c in matches], key="rc_course")
-    course = next(c for c in matches if c["course_name"] == name)
+    def _lab(c):
+        return f"{c.get('category_id') or '—'} — {c['course_name']}"
+    pick = st.selectbox("Course", [_lab(c) for c in matches], key="rc_course")
+    course = next(c for c in matches if _lab(c) == pick)
+    doc = get_spec_doc(course.get("spec_doc_id"))
+    spec_data = spec_doc_data(doc) if doc.get("status") == "processed" else {}
 
-    # ── left: course details · right: specification & extracted requirements ──
+    # ── left: course details · right: stored specification data ──
     left, right = st.columns([1, 1], gap="large")
     with left:
         st.markdown(
             '<div class="vr-panel"><h5>📘 Course details (tracker)</h5>'
             f'<div class="fld">Number</div><div class="txt">{html.escape(str(course.get("category_id") or "—"))}</div>'
             f'<div class="fld">Level · Type</div><div class="txt">Level {html.escape(str(course.get("level") or "—"))} · {html.escape(str(course.get("course_type") or "—"))}</div>'
-            f'<div class="fld">Entry Requirements</div><div class="txt">{html.escape((course.get("entry_requirements") or "—")[:1200])}</div>'
-            f'<div class="fld">Method of Assessment</div><div class="txt">{html.escape((course.get("method_of_assessment") or "—")[:1200])}</div>'
+            f'<div class="fld">Course page</div><div class="txt">{html.escape(str(course.get("course_url") or "—"))}</div>'
+            f'<div class="fld">Entry Requirements (record)</div><div class="txt">{html.escape((course.get("entry_requirements") or "—")[:900])}</div>'
+            f'<div class="fld">Method of Assessment (record)</div><div class="txt">{html.escape((course.get("method_of_assessment") or "—")[:900])}</div>'
             '</div>', unsafe_allow_html=True)
     with right:
-        st.markdown(
-            '<div class="vr-panel"><h5>📑 Specification & extracted requirements</h5>'
-            f'<div class="fld">Document</div><div class="txt">{html.escape(str(course.get("spec_filename") or course.get("spec_url") or "— not uploaded —"))}</div>'
-            f'<div class="fld">Qualification Specification</div><div class="txt">{html.escape((course.get("spec_qualification") or "— not extracted —")[:1200])}</div>'
-            f'<div class="fld">Entry Requirements</div><div class="txt">{html.escape((course.get("spec_entry_requirements") or "— not extracted —")[:1200])}</div>'
-            f'<div class="fld">Method of Assessment</div><div class="txt">{html.escape((course.get("spec_assessment") or "— not extracted —")[:1200])}</div>'
-            '</div>', unsafe_allow_html=True)
-
-    # ── the three check tabs (existing functionality preserved) ──
-    tab_content, tab_other = st.tabs(
-        ["✅ Content Check", "🧪 Other Checks"])
-
-    # ═══ CONTENT CHECK — validation against the specification ═══
-    with tab_content:
-        st.caption("Compares **Qualification Specification**, **Entry Requirements** and "
-                   "**Method of Assessment (wording only)** against the extracted "
-                   "specification document.")
-        if not (course.get("spec_entry_requirements") or course.get("spec_qualification")
-                or course.get("spec_assessment")):
-            st.warning("No specification sections extracted for this course yet — an "
-                       "administrator should upload the specification document in "
-                       "📑 Spec Documents. Validation will flag every section as "
-                       "unverifiable until then.")
-        if st.button("🔍 Run validation", type="primary", key="rc_validate"):
-            with st.spinner(f"Validating {course['course_name']} …"):
-                result = validate_course_vs_spec(course, api_key, model)
-            save_validation_report(course["id"], AUTH["username"], result["status"],
-                                   result.get("summary", ""), result)
-            st.session_state["val_result"] = {"course_id": course["id"], "result": result}
-
-        cached = st.session_state.get("val_result")
-        if cached and cached["course_id"] == course["id"]:
-            result = cached["result"]
-            st.write("")
-            render_validation_html(course, result)
-            st.divider()
-            st.markdown("#### ⬇️ Download Report")
-            validation_downloads(course, result, "rc")
+        if spec_data:
+            lo_n = len(spec_data.get("learning_outcomes") or [])
+            mu_n = len(spec_data.get("mandatory_units") or [])
+            st.markdown(
+                '<div class="vr-panel"><h5>📑 Stored specification data</h5>'
+                f'<div class="fld">Document</div><div class="txt">{html.escape(str(doc.get("filename") or doc.get("spec_url") or "—"))} · processed {html.escape(str(doc.get("processed_at") or ""))}</div>'
+                f'<div class="fld">Qualification</div><div class="txt">{html.escape(str(spec_data.get("qualification_name") or "—"))} · Level {html.escape(str(spec_data.get("qualification_level") or "—"))} · {html.escape(str(spec_data.get("qualification_type") or "—"))}</div>'
+                f'<div class="fld">Entry Requirements</div><div class="txt">{html.escape((spec_data.get("entry_requirements") or "—")[:700])}</div>'
+                f'<div class="fld">Method of Assessment</div><div class="txt">{html.escape((spec_data.get("method_of_assessment") or "—")[:700])}</div>'
+                f'<div class="fld">Specification Requirements</div><div class="txt">{html.escape((spec_data.get("qualification_specification_requirements") or "—")[:700])}</div>'
+                f'<div class="fld">Learning Outcomes · Mandatory Units</div><div class="txt">{lo_n} outcome(s) · {mu_n} unit(s) stored</div>'
+                '</div>', unsafe_allow_html=True)
         else:
-            # show the latest saved validation for this course, if any
-            prior = [r for r in latest_validation_reports() if r["course_id"] == course["id"]]
-            if prior:
-                r = prior[0]
-                st.caption(f"Last validated {r['checked_at']} by {r['checked_by']} — "
-                           f"status: {'✅ pass' if r['status'] == 'pass' else '⚠️ errors'}. "
-                           "Run validation to refresh.")
+            st.markdown('<div class="vr-panel"><h5>📑 Stored specification data</h5>'
+                        '<div class="txt">— not processed yet —</div></div>',
+                        unsafe_allow_html=True)
+            st.warning("The specification document for this course has not been processed "
+                       "yet. An administrator needs to process it once in **📑 Spec "
+                       "Documents**; after that every check reuses the stored data.")
 
-    # ═══ OTHER CHECKS — existing live-page 3-way audit (unchanged) ═══
-    with tab_other:
-        st.caption("Checks the live course page against the tracker and the official "
-                   "specification — the original 3-way audit.")
-        selected_fields = [k for k, label in FIELD_OPTIONS.items()
-                           if st.checkbox(label, value=True, key=f"oc_field_{k}")]
-        if not selected_fields:
-            st.warning("Select at least one field to check.")
-        else:
-            st.caption(f"Checking fields: **{', '.join(FIELD_OPTIONS[k] for k in selected_fields)}**")
+    # ── run the validation ──
+    st.write("")
+    if st.button("🔍 Run Check", type="primary", key="rc_validate",
+                 disabled=not spec_data):
+        page_text = ""
+        if course.get("course_url"):
+            with st.spinner("Loading the live course page …"):
+                try:
+                    page_text = extract_page_text(course["course_url"])
+                except Exception as e:
+                    st.warning(f"Could not load the course page ({e}) — validating the "
+                               "tracker record instead.")
+        with st.spinner(f"Validating {course['course_name']} against the stored "
+                        "specification data …"):
+            result = validate_course_vs_spec(course, spec_data, page_text, api_key, model)
+        save_validation_report(course["id"], AUTH["username"], result["status"],
+                               result.get("summary", ""), result)
+        st.session_state["val_result"] = {"course_id": course["id"], "result": result}
 
-            colA, colB = st.columns([1, 1], gap="large")
-
-            # ── Single course check ──
-            with colA:
-                st.markdown("#### 🎯 Check this course")
-                if st.button("🔍 Check this course", type="primary", key="single"):
-                    if not api_key:
-                        st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
-                    else:
-                        with st.spinner(f"Checking {name} …"):
-                            rep = check_course(course, selected_fields, api_key, model)
-                        save_report(course["id"], selected_fields, rep["status"],
-                                    rep["errors"], rep["summary"], rep.get("rewrites"))
-                        if rep["status"] == "pass":
-                            st.success(f"✅ **{name}** — no errors found. {rep['summary']}")
-                        elif rep["status"] == "errors":
-                            st.error(f"⚠️ **{name}** — {len(rep['errors'])} issue(s). {rep['summary']}")
-                            for err in rep["errors"]:
-                                with st.expander(f"❌ {err.get('field')} · {str(err.get('severity','')).upper()} — {err.get('issue','')[:70]}"):
-                                    st.markdown(f"**Issue:** {err.get('issue')}")
-                                    st.markdown(f"**Live page says:** {err.get('live_content')}")
-                                    st.markdown(f"**Expected:** {err.get('expected_content')}")
-                                    st.markdown(f"**💡 Suggested fix:** {err.get('suggested_fix')}")
-                            for rw in rep.get("rewrites", []):
-                                orig = rw.get("originality", 0)
-                                badge = "🟢" if orig >= 90 else ("🟡" if orig >= 75 else "🔴")
-                                with st.expander(f"✨ Suggested wording — {rw.get('field')} "
-                                                 f"({badge} {orig}% original)", expanded=True):
-                                    st.text_area("Copy-ready replacement text",
-                                                 rw.get("suggested_wording", ""),
-                                                 height=160, key=f"rw_{name}_{rw.get('field')}")
-                                    st.caption(f"Originality {orig}% — share of 4-word phrases NOT "
-                                               "found in the specification, live page or tracker. "
-                                               "Verified plagiarism-safe before display.")
-                        else:
-                            st.warning(f"Check failed — {rep['summary']}")
-
-            # ── Bulk check ──
-            with colB:
-                st.markdown("#### 🚀 Bulk check")
-                targets = matches
-                st.caption(f"{len(targets)} filtered course(s) will be checked")
-                workers = st.slider("Parallel workers", min_value=1, max_value=10, value=6, key="bulk_workers",
-                                    help="How many courses to check at the same time. Higher = faster, "
-                                         "but lower it if you hit API rate limits.")
-                if st.button(f"🚀 Run bulk check on {len(targets)} courses", type="primary", key="bulk"):
-                    if not api_key:
-                        st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
-                    else:
-                        bar = st.progress(0.0)
-                        status = st.empty()
-                        results = {"pass": 0, "errors": 0, "failed": 0}
-                        log = st.container()
-                        done = 0
-                        t0 = time.time()
-                        # Workers only do network + LLM work (thread-safe).
-                        # DB writes and UI updates happen here in the main thread.
-                        with ThreadPoolExecutor(max_workers=workers) as pool:
-                            futures = {
-                                pool.submit(check_course, c, selected_fields, api_key, model): c
-                                for c in targets
-                            }
-                            for fut in as_completed(futures):
-                                cc = futures[fut]
-                                try:
-                                    rep = fut.result()
-                                except Exception as e:
-                                    rep = {"course_id": cc["id"], "course_name": cc["course_name"],
-                                           "status": "failed", "summary": f"Unexpected error: {e}",
-                                           "errors": [], "rewrites": []}
-                                save_report(cc["id"], selected_fields, rep["status"],
-                                            rep["errors"], rep["summary"], rep.get("rewrites"))
-                                results[rep["status"]] += 1
-                                done += 1
-                                icon = {"pass": "✅", "errors": "⚠️", "failed": "❌"}[rep["status"]]
-                                log.markdown(f"{icon} **{cc['course_name']}** — "
-                                             f"{len(rep['errors'])} issue(s). {rep['summary'][:120]}")
-                                status.markdown(f"⏳ **{done}/{len(targets)}** done "
-                                                f"({time.time() - t0:.0f}s elapsed)")
-                                bar.progress(done / len(targets))
-                        status.empty()
-                        r1, r2, r3 = st.columns(3)
-                        stat(r1, results["pass"], "Passed", "ok")
-                        stat(r2, results["errors"], "With errors", "err")
-                        stat(r3, results["failed"], "Failed to check", "warn")
-                        st.success("Bulk check complete — reports saved to the database. "
-                                   "Head to 📊 Reports to export the Word document.")
-
-
-
-# ───────────────────────────────────────────────
-# PAGE · GRAMMAR CHECK (user + admin)
-# ───────────────────────────────────────────────
-def page_grammar_check():
-    st.subheader("Content Quality Check")
-
-    courses = all_courses()
-    course = {}
-
-    if courses:
-        st.caption("Choose a course only if you want to use its stored course overview. You can also paste text or upload a file directly.")
-        matches, _ = filter_bar("gc")
-        if matches:
-            name = st.selectbox("Course", [c["course_name"] for c in matches], key="gc_course")
-            course = next(c for c in matches if c["course_name"] == name)
-        else:
-            st.warning("No courses match the selected filters. You can still paste or upload text below.")
+    cached = st.session_state.get("val_result")
+    if cached and cached["course_id"] == course["id"]:
+        result = cached["result"]
+        st.write("")
+        render_validation_html(course, result)
+        st.divider()
+        st.markdown("#### ⬇️ Download Report")
+        validation_downloads(course, result, "rc")
     else:
-        st.info("No courses are available yet, but you can still paste text or upload a file for grammar checking.")
+        prior = [r for r in latest_validation_reports() if r["course_id"] == course["id"]]
+        if prior:
+            r = prior[0]
+            st.caption(f"Last validated {r['checked_at']} by {r['checked_by']} — "
+                       f"status: {'✅ pass' if r['status'] == 'pass' else '⚠️ errors'}. "
+                       "Run Check to refresh.")
 
+
+# ───────────────────────────────────────────────
+# PAGE · GRAMMAR CHECK (its own tab — moved out of Run Check)
+# ───────────────────────────────────────────────
+def page_grammar():
+    st.subheader("Grammar Check")
     st.caption("Paste or upload course content. The reviewer highlights grammar, "
                "articles, sentence structure, capitalisation, proper nouns, spelling, "
                "commas and punctuation consistency — colour-coded like a "
@@ -2053,19 +2318,25 @@ def page_grammar_check():
     st.write("")
 
     src = st.radio("Input", ["Paste text", "Upload file (.txt / .docx)",
-                             "Use this course's overview"], horizontal=True)
+                             "Use a course's overview"], horizontal=True, key="gc_src")
     text = ""
     if src == "Paste text":
-        text = st.text_area("Course content to review", height=220,
+        text = st.text_area("Course content to review", height=220, key="gc_paste",
                             placeholder="Paste the course description, overview or any page copy here…")
-    elif src == "Use this course's overview":
-        text = course.get("course_overview") or ""
-        if text:
-            st.text_area("Loaded content", text, height=180, key="gc_qr_course_text")
+    elif src == "Use a course's overview":
+        names = [c["course_name"] for c in all_courses()]
+        if not names:
+            st.info("No courses imported yet.")
         else:
-            st.info("This course has no overview text in the tracker.")
+            cname = st.selectbox("Course", names, key="gc_course")
+            crs = next(c for c in all_courses() if c["course_name"] == cname)
+            text = crs.get("course_overview") or ""
+            if text:
+                st.text_area("Loaded content", text, height=180, key="qr_course_text")
+            else:
+                st.info("This course has no overview text in the tracker.")
     else:
-        f = st.file_uploader("Upload content", type=["txt", "docx"], key="gc_qr_up")
+        f = st.file_uploader("Upload content", type=["txt", "docx"], key="qr_up")
         if f:
             if f.name.lower().endswith(".docx"):
                 d = Document(io.BytesIO(f.read()))
@@ -2074,21 +2345,22 @@ def page_grammar_check():
                 text = f.read().decode("utf-8", errors="ignore")
             st.text_area("Loaded content", text, height=180)
 
-    if st.button("✍️ Review content quality", type="primary", disabled=not text.strip()):
+    if st.button("✍️ Review content quality", type="primary", disabled=not text.strip(),
+                 key="gc_go"):
         if not api_key:
             st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
         else:
             with st.spinner("Proofreading …"):
                 try:
                     result = run_quality_review(text, api_key, model)
-                    st.session_state["gc_qr_result"] = result
-                    st.session_state["gc_qr_text"] = text
+                    st.session_state["qr_result"] = result
+                    st.session_state["qr_text"] = text
                 except Exception as e:
                     st.error(f"Review failed: {e}")
 
-    if "gc_qr_result" in st.session_state:
-        result = st.session_state["gc_qr_result"]
-        text = st.session_state["gc_qr_text"]
+    if "qr_result" in st.session_state:
+        result = st.session_state["qr_result"]
+        text = st.session_state["qr_text"]
         issues = result.get("issues", [])
 
         c1, c2, c3 = st.columns(3)
@@ -2130,6 +2402,121 @@ def page_grammar_check():
                     f'<span class="corr">{html.escape(str(issue.get("correction","")))}</span><br>'
                     f'<small>{html.escape(str(issue.get("explanation","")))}</small>'
                     f'</div>', unsafe_allow_html=True)
+
+
+# ───────────────────────────────────────────────
+# PAGE · OTHER CHECKS (existing live-page 3-way audit — its own tab)
+# ───────────────────────────────────────────────
+def page_other_checks():
+    st.subheader("Other Checks")
+    st.caption("Checks the live course page against the tracker and the official "
+               "specification — the original 3-way audit.")
+    courses = all_courses()
+    if not courses:
+        st.info("No courses available yet.")
+        return
+
+    matches, _ = filter_bar("oc")
+    if not matches:
+        st.warning("No courses match the selected filters.")
+        return
+    name = st.selectbox("Course", [c["course_name"] for c in matches], key="oc_course")
+    course = next(c for c in matches if c["course_name"] == name)
+
+    selected_fields = [k for k, label in FIELD_OPTIONS.items()
+                       if st.checkbox(label, value=True, key=f"oc_field_{k}")]
+    if not selected_fields:
+        st.warning("Select at least one field to check.")
+        return
+    st.caption(f"Checking fields: **{', '.join(FIELD_OPTIONS[k] for k in selected_fields)}**")
+
+    colA, colB = st.columns([1, 1], gap="large")
+
+    # ── Single course check ──
+    with colA:
+        st.markdown("#### 🎯 Check this course")
+        if st.button("🔍 Check this course", type="primary", key="single"):
+            if not api_key:
+                st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
+            else:
+                with st.spinner(f"Checking {name} …"):
+                    rep = check_course(course, selected_fields, api_key, model)
+                save_report(course["id"], selected_fields, rep["status"],
+                            rep["errors"], rep["summary"], rep.get("rewrites"))
+                if rep["status"] == "pass":
+                    st.success(f"✅ **{name}** — no errors found. {rep['summary']}")
+                elif rep["status"] == "errors":
+                    st.error(f"⚠️ **{name}** — {len(rep['errors'])} issue(s). {rep['summary']}")
+                    for err in rep["errors"]:
+                        with st.expander(f"❌ {err.get('field')} · {str(err.get('severity','')).upper()} — {err.get('issue','')[:70]}"):
+                            st.markdown(f"**Issue:** {err.get('issue')}")
+                            st.markdown(f"**Live page says:** {err.get('live_content')}")
+                            st.markdown(f"**Expected:** {err.get('expected_content')}")
+                            st.markdown(f"**💡 Suggested fix:** {err.get('suggested_fix')}")
+                    for rw in rep.get("rewrites", []):
+                        orig = rw.get("originality", 0)
+                        badge = "🟢" if orig >= 90 else ("🟡" if orig >= 75 else "🔴")
+                        with st.expander(f"✨ Suggested wording — {rw.get('field')} "
+                                         f"({badge} {orig}% original)", expanded=True):
+                            st.text_area("Copy-ready replacement text",
+                                         rw.get("suggested_wording", ""),
+                                         height=160, key=f"rw_{name}_{rw.get('field')}")
+                            st.caption(f"Originality {orig}% — share of 4-word phrases NOT "
+                                       "found in the specification, live page or tracker. "
+                                       "Verified plagiarism-safe before display.")
+                else:
+                    st.warning(f"Check failed — {rep['summary']}")
+
+    # ── Bulk check ──
+    with colB:
+        st.markdown("#### 🚀 Bulk check")
+        targets = matches
+        st.caption(f"{len(targets)} filtered course(s) will be checked")
+        workers = st.slider("Parallel workers", min_value=1, max_value=10, value=6, key="bulk_workers",
+                            help="How many courses to check at the same time. Higher = faster, "
+                                 "but lower it if you hit API rate limits.")
+        if st.button(f"🚀 Run bulk check on {len(targets)} courses", type="primary", key="bulk"):
+            if not api_key:
+                st.error("No API key found — add OPENROUTER_API_KEY to .streamlit/secrets.toml and restart.")
+            else:
+                bar = st.progress(0.0)
+                status = st.empty()
+                results = {"pass": 0, "errors": 0, "failed": 0}
+                log = st.container()
+                done = 0
+                t0 = time.time()
+                # Workers only do network + LLM work (thread-safe).
+                # DB writes and UI updates happen here in the main thread.
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(check_course, c, selected_fields, api_key, model): c
+                        for c in targets
+                    }
+                    for fut in as_completed(futures):
+                        cc = futures[fut]
+                        try:
+                            rep = fut.result()
+                        except Exception as e:
+                            rep = {"course_id": cc["id"], "course_name": cc["course_name"],
+                                   "status": "failed", "summary": f"Unexpected error: {e}",
+                                   "errors": [], "rewrites": []}
+                        save_report(cc["id"], selected_fields, rep["status"],
+                                    rep["errors"], rep["summary"], rep.get("rewrites"))
+                        results[rep["status"]] += 1
+                        done += 1
+                        icon = {"pass": "✅", "errors": "⚠️", "failed": "❌"}[rep["status"]]
+                        log.markdown(f"{icon} **{cc['course_name']}** — "
+                                     f"{len(rep['errors'])} issue(s). {rep['summary'][:120]}")
+                        status.markdown(f"⏳ **{done}/{len(targets)}** done "
+                                        f"({time.time() - t0:.0f}s elapsed)")
+                        bar.progress(done / len(targets))
+                status.empty()
+                r1, r2, r3 = st.columns(3)
+                stat(r1, results["pass"], "Passed", "ok")
+                stat(r2, results["errors"], "With errors", "err")
+                stat(r3, results["failed"], "Failed to check", "warn")
+                st.success("Bulk check complete — reports saved to the database. "
+                           "Head to 📊 Reports to export the Word document.")
 
 
 # ───────────────────────────────────────────────
@@ -2306,9 +2693,10 @@ def page_users():
 # ═══════════════════════════════════════════════════════════════════
 
 if IS_ADMIN:
-    t_imp, t_spec, t_mng, t_run, t_grammar, t_rep, t_usr = st.tabs(
+    t_imp, t_spec, t_mng, t_run, t_gram, t_oth, t_rep, t_usr = st.tabs(
         ["📥 Import Courses", "📑 Spec Documents", "🗂 Manage Courses",
-         "🔍 Run Check", "✍️ Grammar Check", "📊 Reports", "👥 Users"])
+         "🔍 Run Check", "✍️ Grammar Check", "🧪 Other Checks",
+         "📊 Reports", "👥 Users"])
     with t_imp:
         page_import()
     with t_spec:
@@ -2317,19 +2705,24 @@ if IS_ADMIN:
         page_manage()
     with t_run:
         page_run_check()
-    with t_grammar:
-        page_grammar_check()
+    with t_gram:
+        page_grammar()
+    with t_oth:
+        page_other_checks()
     with t_rep:
         page_reports()
     with t_usr:
         page_users()
 else:
-    # Users get Run Check, Grammar Check and Reports.
-    # No upload or data-modification pages are available to them.
-    t_run, t_grammar, t_rep = st.tabs(["🔍 Run Check", "✍️ Grammar Check", "📊 Reports"])
+    # Users get Run Check (validate, view & download reports), Grammar Check,
+    # Other Checks and Reports. No upload or data-modification pages.
+    t_run, t_gram, t_oth, t_rep = st.tabs(
+        ["🔍 Run Check", "✍️ Grammar Check", "🧪 Other Checks", "📊 Reports"])
     with t_run:
         page_run_check()
-    with t_grammar:
-        page_grammar_check()
+    with t_gram:
+        page_grammar()
+    with t_oth:
+        page_other_checks()
     with t_rep:
         page_reports()
